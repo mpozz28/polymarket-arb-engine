@@ -1,4 +1,5 @@
-from src.core.models import Opportunity, PortfolioState, ApprovedTrade
+from src.core.models import ApprovedTrade, Opportunity, PortfolioState
+
 
 class RiskManager:
     def __init__(self, assumed_win_probability: float = 0.99):
