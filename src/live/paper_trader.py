@@ -1,115 +1,199 @@
-import time
 import logging
-from typing import Dict, List, Any
+import math
+import time
+from typing import Any
+
 from src.core.models import Market, OrderBook, OrderBookLevel, PortfolioState
 from src.detectors.base import BaseDetector
 from src.risk.manager import RiskManager
 
 logger = logging.getLogger(__name__)
 
+
+def _timestamp_seconds(value: object, reference_seconds: float | None = None) -> float:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    # Real Unix timestamps in milliseconds are ~1e12.
+    if timestamp >= 100_000_000_000:
+        return timestamp / 1000.0
+
+    # For synthetic/test timestamps, infer the unit from the previous
+    # order-book timestamp when available.
+    if reference_seconds is not None and reference_seconds > 0:
+        seconds_candidate = timestamp
+        milliseconds_candidate = timestamp / 1000.0
+
+        seconds_distance = abs(seconds_candidate - reference_seconds)
+        milliseconds_distance = abs(milliseconds_candidate - reference_seconds)
+
+        if milliseconds_distance < seconds_distance:
+            return milliseconds_candidate
+
+    return timestamp
+
+
 class LivePaperTrader:
-    def __init__(self, markets: List[Market], detectors: List[BaseDetector], risk_manager: RiskManager, portfolio: PortfolioState):
+    def __init__(
+        self,
+        markets: list[Market],
+        detectors: list[BaseDetector],
+        risk_manager: RiskManager,
+        portfolio: PortfolioState,
+    ):
         self.detectors = detectors
         self.risk_manager = risk_manager
         self.portfolio = portfolio
-        
-        # Mappiamo i token_id al rispettivo mercato per un lookup O(1) ultra-veloce
-        self.markets_by_token: Dict[str, Market] = {}
-        for m in markets:
-            for t in m.tokens:
-                self.markets_by_token[t.token_id] = m
-                
-        # Stato in memoria degli order book e cooldown
-        self.order_books: Dict[str, OrderBook] = {}
-        self.last_alert_time: Dict[str, float] = {}
-        
-    async def process_ws_message(self, data: Any):
-        """
-        Gestione robusta: smista i dati sia se Polymarket invia un dizionario singolo,
-        sia se invia una lista di aggiornamenti in blocco.
-        """
+        self.markets_by_token: dict[str, Market] = {
+            token.token_id: market
+            for market in markets
+            for token in market.tokens
+        }
+        self.order_books: dict[str, OrderBook] = {}
+        self.last_alert_time: dict[str, float] = {}
+
+    async def process_ws_message(self, data: Any) -> None:
         if isinstance(data, list):
             for item in data:
-                await self._parse_single_message(item)
+                if isinstance(item, dict):
+                    await self._parse_single_message(item)
         elif isinstance(data, dict):
             await self._parse_single_message(data)
 
-    async def _parse_single_message(self, data: dict):
-        # --- ⏱️ START CRONOMETRO ---
+    async def _parse_single_message(self, data: dict) -> None:
         start_time = time.perf_counter()
-        
-        # Estrazione sicura dell'ID (Polymarket usa formati misti)
-        token_id = data.get("asset_id", data.get("token_id"))
-        if not token_id:
+        event_type = str(data.get("event_type", data.get("type", ""))).lower()
+
+        if event_type == "price_change":
+            self._handle_price_change(data)
+        elif event_type == "book" or "bids" in data or "asks" in data:
+            self._handle_book_snapshot(data)
+
+        processing_time_ms = (time.perf_counter() - start_time) * 1000.0
+        if processing_time_ms > 1.0:
+            logger.info("Market-data processing latency: %.3f ms", processing_time_ms)
+
+    def _handle_book_snapshot(self, data: dict) -> None:
+        token_id = str(data.get("asset_id", data.get("token_id", "")))
+        if not token_id or token_id not in self.markets_by_token:
             return
-            
-        market = self.markets_by_token.get(token_id)
-        if not market:
-            return # Token ignorato
-            
-        bids_raw = data.get("bids", [])
-        asks_raw = data.get("asks", [])
-        
-        if bids_raw or asks_raw:
-            # Aggiorniamo il book
-            self.order_books[token_id] = OrderBook(
-                token_id=token_id,
-                timestamp=time.time(),
-                bids=[OrderBookLevel(price=float(b["price"]), size=float(b["size"])) for b in bids_raw if "price" in b and "size" in b],
-                asks=[OrderBookLevel(price=float(a["price"]), size=float(a["size"])) for a in asks_raw if "price" in a and "size" in a]
+
+        self.order_books[token_id] = OrderBook(
+            token_id=token_id,
+            timestamp=_timestamp_seconds(data.get("timestamp")),
+            bids=self._sort_levels(data.get("bids", data.get("buys", [])), reverse=True),
+            asks=self._sort_levels(data.get("asks", data.get("sells", [])), reverse=False),
+        )
+        self._evaluate_if_market_ready(self.markets_by_token[token_id])
+
+    def _handle_price_change(self, data: dict) -> None:
+        changes = data.get("price_changes", data.get("changes", []))
+        if not isinstance(changes, list):
+            return
+
+        affected_markets = []
+
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+
+            token_id = str(change.get("asset_id", change.get("token_id", "")))
+            market = self.markets_by_token.get(token_id)
+            book = self.order_books.get(token_id)
+
+            if market is None or book is None:
+                continue
+
+            timestamp = _timestamp_seconds(
+                data.get("timestamp"),
+                reference_seconds=book.timestamp,
             )
-            
-            # Verifichiamo se abbiamo tutti i book necessari per QUESTO specifico mercato
-            market_token_ids = [t.token_id for t in market.tokens]
-            if all(tid in self.order_books for tid in market_token_ids):
-                
-                # Esecuzione dei calcoli (Spread Scanner + Kelly)
-                self._evaluate_market(market)
-                
-                # --- ⏱️ STOP CRONOMETRO ---
-                end_time = time.perf_counter()
-                processing_time_ms = (end_time - start_time) * 1000
-                
-                # Stampiamo il tempo solo se è superiore a 1 millisecondo (evita di spammare micro-calcoli)
-                if processing_time_ms > 1.0:
-                    logger.info(f"⏱️ Latenza di calcolo (Tick-to-Trade): {processing_time_ms:.3f} ms")
 
-    def _evaluate_market(self, market: Market):
-        # --- AGGIUNTA PER TEST VISIVO: Scanner di Spread Live ---
+            try:
+                price = float(change["price"])
+                size = float(change["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            side = str(change.get("side", "")).upper()
+            if side not in {"BUY", "SELL"}:
+                continue
+
+            levels = book.bids if side == "BUY" else book.asks
+            levels[:] = [
+                level for level in levels
+                if not math.isclose(level.price, price, abs_tol=1e-12)
+            ]
+            if size > 0:
+                levels.append(OrderBookLevel(price=price, size=size))
+
+            levels.sort(key=lambda level: level.price, reverse=side == "BUY")
+            book.timestamp = timestamp if timestamp else book.timestamp
+            if market not in affected_markets:
+                affected_markets.append(market)
+
+        for market in affected_markets:
+            self._evaluate_if_market_ready(market)
+
+    @staticmethod
+    def _sort_levels(raw_levels: Any, reverse: bool) -> list[OrderBookLevel]:
+        if not isinstance(raw_levels, list):
+            return []
+
+        levels: list[OrderBookLevel] = []
+        for raw in raw_levels:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                levels.append(OrderBookLevel(price=float(raw["price"]), size=float(raw["size"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return sorted(levels, key=lambda level: level.price, reverse=reverse)
+
+    def _evaluate_if_market_ready(self, market: Market) -> None:
+        if all(token.token_id in self.order_books for token in market.tokens):
+            self._evaluate_market(market)
+
+    def _evaluate_market(self, market: Market) -> None:
         if len(market.tokens) == 2:
-            t1, t2 = market.tokens[0].token_id, market.tokens[1].token_id
-            book1, book2 = self.order_books.get(t1), self.order_books.get(t2)
-            
-            # Se entrambi i token hanno liquidità in vendita (asks)
+            first = market.tokens[0].token_id
+            second = market.tokens[1].token_id
+            book1 = self.order_books.get(first)
+            book2 = self.order_books.get(second)
             if book1 and book2 and book1.asks and book2.asks:
-                best_ask1 = book1.asks[0].price
-                best_ask2 = book2.asks[0].price
-                spread_sum = best_ask1 + best_ask2
-                
+                spread_sum = book1.best_ask + book2.best_ask
                 if spread_sum < 1.05:
-                    logger.info(f"📊 [LIVE SPREAD] {market.question[:50]}... | Totale: ${spread_sum:.3f} (Sì: {best_ask1:.2f} + No: {best_ask2:.2f})")
-        # --------------------------------------------------------
+                    logger.info(
+                        "[LIVE SPREAD] %s | top-of-book sum: $%.3f",
+                        market.question[:80],
+                        spread_sum,
+                    )
 
-        # Esecuzione classica del Detector di Arbitraggio
         for detector in self.detectors:
-            opportunities = detector.detect(market, self.order_books)
-            for opp in opportunities:
-                trade = self.risk_manager.evaluate_opportunity(opp, self.portfolio)
+            for opportunity in detector.detect(market, self.order_books):
+                trade = self.risk_manager.evaluate_opportunity(opportunity, self.portfolio)
                 if trade.approved_capital > 0:
                     self._execute_paper_trade(trade, market)
 
-    def _execute_paper_trade(self, trade, market: Market):
+    def _execute_paper_trade(self, trade, market: Market) -> None:
         current_time = time.time()
-        # Cooldown di 10 secondi per lo stesso mercato per non spammare la console
-        if current_time - self.last_alert_time.get(market.condition_id, 0) < 10.0:
+        if current_time - self.last_alert_time.get(market.condition_id, 0.0) < 10.0:
             return
-            
+
         self.last_alert_time[market.condition_id] = current_time
-        
-        logger.info("="*60)
-        logger.info(f"🚨 OPPORTUNITÀ MULTI-MARKET: {market.question}")
-        logger.info(f"Costo medio per share: ${trade.opportunity.total_capital_required/trade.opportunity.max_executable_size:.4f} (Max Size eseguibile: {trade.opportunity.max_executable_size:.1f})")
-        logger.info(f"Capitale allocato (Kelly): ${trade.approved_capital:.2f} ({trade.reason})")
-        logger.info(f"Net PnL Atteso: ${trade.opportunity.expected_net_pnl:.2f} (ROI: {trade.opportunity.expected_roi_bps/100:.2f}%)")
-        logger.info("="*60)
-    
+        logger.info("%s", "=" * 60)
+        logger.info("PAPER ARBITRAGE: %s", market.question)
+        logger.info(
+            "Average executable cost/share: $%.4f | max size: %.2f",
+            trade.opportunity.total_capital_required / trade.opportunity.max_executable_size,
+            trade.opportunity.max_executable_size,
+        )
+        logger.info("Capital allocated: $%.2f (%s)", trade.approved_capital, trade.reason)
+        logger.info(
+            "Expected net PnL: $%.2f | ROI: %.2f%%",
+            trade.opportunity.expected_net_pnl,
+            trade.opportunity.expected_roi_bps / 100.0,
+        )
+        logger.info("%s", "=" * 60)

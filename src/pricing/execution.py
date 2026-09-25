@@ -1,58 +1,73 @@
-from typing import List
-from src.core.models import OrderBook, OrderBookLevel, OrderSide, ExecutionSimulation
+
+from src.core.models import ExecutionSimulation, OrderBook, OrderSide
+
 
 class PricingEngine:
-    def __init__(self, taker_fee_rate: float = 0.00):
-        """
-        taker_fee_rate: percentuale (es. 0.001 per 0.1%). 
-        Attualmente Polymarket ha spesso 0% di fee di trading, ma lo rendiamo configurabile.
-        """
-        self.taker_fee_rate = taker_fee_rate
+    """Executable pricing, slippage and fee calculations."""
 
-    def simulate_market_order(self, book: OrderBook, side: OrderSide, target_size: float) -> ExecutionSimulation:
-        """
-        Simula l'esecuzione di un ordine a mercato percorrendo il book (Order Book Walking).
-        Restituisce un report dettagliato su prezzo medio, costo e slippage.
-        """
+    def __init__(self, taker_fee_rate: float = 0.0):
+        self.taker_fee_rate = max(0.0, taker_fee_rate)
+
+    @staticmethod
+    def taker_fee_usd(shares: float, price: float, fee_rate: float) -> float:
+        """Polymarket documented fee curve: C * feeRate * p * (1-p)."""
+        if shares <= 0 or price <= 0 or price >= 1 or fee_rate <= 0:
+            return 0.0
+        return shares * fee_rate * price * (1.0 - price)
+
+    def effective_price(
+        self,
+        price: float,
+        fee_rate: float | None = None,
+        side: OrderSide = OrderSide.BUY,
+    ) -> float:
+        rate = self.taker_fee_rate if fee_rate is None else max(0.0, fee_rate)
+        fee = self.taker_fee_usd(1.0, price, rate)
+        if side == OrderSide.BUY:
+            return price + fee
+        return price - fee
+
+    def simulate_market_order(
+        self,
+        book: OrderBook,
+        side: OrderSide,
+        target_size: float,
+        fee_rate: float | None = None,
+    ) -> ExecutionSimulation:
         if target_size <= 0:
-            raise ValueError("Target size deve essere maggiore di zero.")
+            raise ValueError("target_size must be greater than zero")
 
-        # Se compriamo, dobbiamo consumare gli Asks (ordinati dal prezzo più basso al più alto)
-        # Se vendiamo, dobbiamo consumare i Bids (ordinati dal prezzo più alto al più basso)
-        levels = book.asks if side == OrderSide.BUY else book.bids
-        
-        # Assicuriamoci che i livelli siano ordinati correttamente.
-        # Spesso l'API li restituisce già ordinati, ma noi non ci fidiamo mai dei dati esterni.
-        reverse_sort = True if side == OrderSide.SELL else False
-        sorted_levels = sorted(levels, key=lambda x: x.price, reverse=reverse_sort)
+        rate = self.taker_fee_rate if fee_rate is None else max(0.0, fee_rate)
+        levels = list(book.asks if side == OrderSide.BUY else book.bids)
+        sorted_levels = sorted(levels, key=lambda level: level.price, reverse=side == OrderSide.SELL)
 
         if not sorted_levels:
-            # Book vuoto
             return self._empty_simulation(side, target_size)
 
         best_price = sorted_levels[0].price
         remaining_size = target_size
         total_cost = 0.0
         executed_size = 0.0
+        fees = 0.0
 
         for level in sorted_levels:
             if remaining_size <= 0:
                 break
-
             fill_size = min(remaining_size, level.size)
             executed_size += fill_size
             total_cost += fill_size * level.price
+            fees += self.taker_fee_usd(fill_size, level.price, rate)
             remaining_size -= fill_size
 
-        if executed_size == 0:
+        if executed_size <= 0:
             return self._empty_simulation(side, target_size)
 
         vwap = total_cost / executed_size
-        fees = total_cost * self.taker_fee_rate
-        
-        # Calcolo Slippage in BPS (Basis Points)
-        # BPS formula: |(VWAP - Best Price) / Best Price| * 10,000
-        slippage_bps = abs((vwap - best_price) / best_price) * 10000 if best_price > 0 else 0.0
+        slippage_bps = (
+            abs((vwap - best_price) / best_price) * 10_000.0
+            if best_price > 0
+            else 0.0
+        )
 
         return ExecutionSimulation(
             side=side,
@@ -62,62 +77,62 @@ class PricingEngine:
             total_cost=total_cost,
             fees_paid=fees,
             slippage_bps=slippage_bps,
-            is_fully_filled=(remaining_size == 0)
+            is_fully_filled=remaining_size <= 1e-12,
         )
 
-    def calculate_max_arb_size(self, yes_book: OrderBook, no_book: OrderBook, max_cost_threshold: float = 0.99) -> float:
-        """
-        Funzione quantitativa avanzata:
-        Calcola la size massima eseguibile per un arbitraggio complementare ("Sì" + "No")
-        prima che l'aumento dei prezzi (slippage combinato) superi il threshold di profitto.
-        Ritorna il numero di quote che possiamo comprare.
-        """
-        # Questa logica verrà estesa nel Modulo 3 (Detectors), ma qui gettiamo le basi.
-        # L'algoritmo cammina simultaneamente su entrambi i book.
-        
-        # Ordinamento Asks
-        yes_asks = sorted(yes_book.asks, key=lambda x: x.price)
-        no_asks = sorted(no_book.asks, key=lambda x: x.price)
-        
-        total_executable_shares = 0.0
-        y_idx, n_idx = 0, 0
-        
-        # Creiamo copie della size dei livelli correnti per non mutare i dati originali
-        current_y_size = yes_asks[y_idx].size if yes_asks else 0
-        current_n_size = no_asks[n_idx].size if no_asks else 0
+    def calculate_max_arb_size(
+        self,
+        yes_book: OrderBook,
+        no_book: OrderBook,
+        max_cost_threshold: float = 0.99,
+        fee_rate: float | None = None,
+    ) -> float:
+        rate = self.taker_fee_rate if fee_rate is None else max(0.0, fee_rate)
+        yes_asks = sorted(yes_book.asks, key=lambda level: level.price)
+        no_asks = sorted(no_book.asks, key=lambda level: level.price)
 
-        while y_idx < len(yes_asks) and n_idx < len(no_asks):
-            current_y_price = yes_asks[y_idx].price
-            current_n_price = no_asks[n_idx].price
-            
-            combined_price = current_y_price + current_n_price
-            
-            # Se aggiungendo le fee il costo totale di comprare 1 quota Yes e 1 No supera il limite, ci fermiamo
-            net_combined_price = combined_price * (1 + self.taker_fee_rate)
-            if net_combined_price >= max_cost_threshold:
+        if not yes_asks or not no_asks:
+            return 0.0
+
+        total_shares = 0.0
+        yes_idx = 0
+        no_idx = 0
+        yes_remaining = yes_asks[0].size
+        no_remaining = no_asks[0].size
+
+        while yes_idx < len(yes_asks) and no_idx < len(no_asks):
+            yes_price = yes_asks[yes_idx].price
+            no_price = no_asks[no_idx].price
+            combined_effective = (
+                self.effective_price(yes_price, rate, OrderSide.BUY)
+                + self.effective_price(no_price, rate, OrderSide.BUY)
+            )
+
+            if combined_effective >= max_cost_threshold:
                 break
-                
-            # Possiamo comprare il minimo tra la size disponibile sui due rami
-            step_size = min(current_y_size, current_n_size)
-            total_executable_shares += step_size
-            
-            current_y_size -= step_size
-            current_n_size -= step_size
-            
-            # Se abbiamo esaurito un livello, passiamo al successivo
-            if current_y_size == 0:
-                y_idx += 1
-                if y_idx < len(yes_asks):
-                    current_y_size = yes_asks[y_idx].size
-                    
-            if current_n_size == 0:
-                n_idx += 1
-                if n_idx < len(no_asks):
-                    current_n_size = no_asks[n_idx].size
 
-        return total_executable_shares
+            step_size = min(yes_remaining, no_remaining)
+            if step_size <= 0:
+                break
 
-    def _empty_simulation(self, side: OrderSide, target_size: float) -> ExecutionSimulation:
+            total_shares += step_size
+            yes_remaining -= step_size
+            no_remaining -= step_size
+
+            if yes_remaining <= 1e-12:
+                yes_idx += 1
+                if yes_idx < len(yes_asks):
+                    yes_remaining = yes_asks[yes_idx].size
+
+            if no_remaining <= 1e-12:
+                no_idx += 1
+                if no_idx < len(no_asks):
+                    no_remaining = no_asks[no_idx].size
+
+        return total_shares
+
+    @staticmethod
+    def _empty_simulation(side: OrderSide, target_size: float) -> ExecutionSimulation:
         return ExecutionSimulation(
             side=side,
             requested_size=target_size,
@@ -126,6 +141,5 @@ class PricingEngine:
             total_cost=0.0,
             fees_paid=0.0,
             slippage_bps=0.0,
-            is_fully_filled=False
+            is_fully_filled=False,
         )
-

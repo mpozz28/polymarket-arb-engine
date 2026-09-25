@@ -1,6 +1,8 @@
 import pytest
-from src.core.models import Opportunity, ArbLeg, OrderSide, PortfolioState
+
+from src.core.models import ArbLeg, Opportunity, OrderSide, PortfolioState
 from src.risk.manager import RiskManager
+
 
 @pytest.fixture
 def sample_opportunity():
