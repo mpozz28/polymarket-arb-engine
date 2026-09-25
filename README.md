@@ -8,7 +8,7 @@ The project consumes public CLOB market data, maintains in-memory order books, e
 
 <img src="assets/backtest.png" width="100%">
 <img src="assets/benchmark.png" width="100%">
-<img src="assets/demo.gif" width="100%">
+<video src="assets/demo1.gif" width="100%">
 
 
 
