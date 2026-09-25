@@ -12,7 +12,7 @@ dependencies = [
     "pydantic>=2.13.0",
     "PyYAML>=6.0.3",
     "pandas>=3.0.0",
-    "numpy>=2.5.0",
+    "numpy>=2.0.0",
     "websockets>=17.0"
 ]
 
