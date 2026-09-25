@@ -6,8 +6,8 @@ The project consumes public CLOB market data, maintains in-memory order books, e
 
 **Scope:** the current implementation is read-only / paper-trading. It does not submit live orders and does not claim production or HFT performance.
 
-![DEMO](assets/demo.gif)
-![DEMO1](assets/demo1.gif)
+<img src="assets/demo.gif" width="80%">
+<img src="assets/demo1.gif" width="80%">
 
 ## Architecture
 
