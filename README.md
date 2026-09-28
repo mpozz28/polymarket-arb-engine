@@ -11,10 +11,6 @@
 
 > **Honest scope:** read-only / paper trading. No live order submission, no HFT claims, and the bundled backtest data is synthetic. This project is about engineering and methodology, not a profitability pitch.
 
-<img src="assets/backtest.png" width="100%">
-<img src="assets/benchmark.png" width="100%">
-<img src="assets/demo1.gif" width="100%">
-
 ---
 
 ## 🎯 Why this project
@@ -80,6 +76,7 @@ python scripts/run_backtest.py --output-dir artifacts/example    # JSON summary 
 Every risk parameter is explicit on the CLI (`--threshold`, `--fee-rate`, `--win-probability`, `--max-exposure`, `--kelly-multiplier`), so there are no hidden settings. Metrics include PnL, return on invested capital, win rate, profit factor and an equity curve for drawdown analysis.
 
 ![Backtest](assets/backtest.png)
+![Benchmark](assets/benchmark.png)
 
 ## 🚀 Quickstart
 
@@ -117,13 +114,5 @@ Next:
 - [ ] Latency and partial-fill model calibrated on captured data
 - [ ] Multi-outcome (negative-risk) market support
 - [ ] Reproducible end-to-end latency benchmark
-
-## 👤 Author
-
-**Your Name** · [LinkedIn](https://linkedin.com/in/your-profile) · [Email](mailto:you@example.com)
-
-*Open to roles in quantitative development, trading technology and backend/data engineering.*
-
----
 
 *Disclaimer: research and educational software, not financial advice.*
